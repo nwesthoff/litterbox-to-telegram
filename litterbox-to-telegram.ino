@@ -2,12 +2,13 @@
 #include <ESP8266WiFi.h>
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
+#include <LittleFS.h>
 
 const unsigned long BOT_MTBS = 5000;  // mean time between scan messages
 const unsigned long LIGHT_MTBR = 50;
-const int MAX_DOOR_OPENS = 5;
+const int MAX_DOOR_OPENS = 15;
 const int MINUTES_NOTIFICATION_TIMEOUT = 5;
-const int threshold = 50;
+const int threshold = 25;
 
 X509List cert(TELEGRAM_CERTIFICATE_ROOT);
 WiFiClientSecure secured_client;
@@ -28,40 +29,123 @@ int door_opened_times = 0;
 
 // Keyboard options
 String keyboardJson = "[[\"/cleaned\", \"/noclean\"]]";
-String botCommandsJson = "[{\"command\":\"reset\", \"description\":\"Zet teller op 0\"},{\"command\":\"start\",\"description\":\"Start\"},{\"command\":\"status\",\"description\":\"Hoe vaak is de kattenbak gebruikt sinds schoonmaken?\"}]";
+String botCommandsJson = "[{\"command\":\"start\",\"description\":\"Start\"},{\"command\":\"cleaned\", \"description\":\"Als je de kattenbak hebt schoongemaakt\"},{\"command\":\"status\",\"description\":\"Hoe vaak is de kattenbak gebruikt sinds schoonmaken?\"},{\"command\":\"stop\",\"description\":\"Geen updates meer ontvangen.\"}]";
 
-const int max_registered_chats = 64;
-String registered_chat_ids[max_registered_chats];
-int registered_chat_ids_length = 0;
+DynamicJsonDocument usersDoc(1500);
+const char *SUBSCRIBED_USERS_FILENAME = "/subscribed_users.json";  // Filename for local storage
 
-void registerChat(String chat_id) {
-  if (registered_chat_ids_length < max_registered_chats) {
-    Serial.print("Registered user: ");
-    Serial.println(chat_id);
+JsonObject getSubscribedUsers() {
+  File subscribedUsersFile = LittleFS.open(SUBSCRIBED_USERS_FILENAME, "r");
+  JsonObject users;
 
-    registered_chat_ids[registered_chat_ids_length] = chat_id;  // Add the item to the array
-    registered_chat_ids_length++;                               // Increment the current size
-  } else {
-    Serial.println("Array is full, cannot add more items.");
+
+  // no file
+  if (!subscribedUsersFile) {
+    Serial.println("Failed to open subscribed users file");
+    // Create empty file (w+ not working as expect)
+    File f = LittleFS.open(SUBSCRIBED_USERS_FILENAME, "w");
+    users = usersDoc.to<JsonObject>();
+    serializeJson(users, f);
+    f.close();
+    return users;
   }
+
+  // too large file
+  size_t size = subscribedUsersFile.size();
+  if (size > 1500) {
+    subscribedUsersFile.close();
+    Serial.println("Subscribed users file is too large");
+    return users;
+  }
+
+  String file_content = subscribedUsersFile.readString();
+  subscribedUsersFile.close();
+
+
+  DeserializationError error = deserializeJson(usersDoc, file_content);
+  if (error) {
+    Serial.println("Failed to parse subscribed users file");
+    return users;
+  }
+
+  users = usersDoc.as<JsonObject>();
+
+  return users;
+}
+
+bool addSubscribedUser(String chat_id, String from_name) {
+  JsonObject users = getSubscribedUsers();
+  users[chat_id] = from_name;
+
+  Serial.print("Subscribed: ");
+  serializeJson(users, Serial);
+  Serial.println("");
+
+  File subscribedUsersFile = LittleFS.open(SUBSCRIBED_USERS_FILENAME, "w+");
+  // file not available
+  if (!subscribedUsersFile) {
+    subscribedUsersFile.close();
+    Serial.println("Failed to open subscribed users file for writing");
+    return false;
+  }
+
+  serializeJson(users, subscribedUsersFile);
+  subscribedUsersFile.close();
+  return true;
+}
+
+bool removeSubscribedUser(String chat_id) {
+  JsonObject users = getSubscribedUsers();
+  users.remove(chat_id);
+
+  File subscribedUsersFile = LittleFS.open(SUBSCRIBED_USERS_FILENAME, "w");
+  // file not available
+  if (!subscribedUsersFile) {
+    subscribedUsersFile.close();
+    Serial.println("Failed to open subscribed users file for writing");
+    return false;
+  }
+
+  serializeJson(users, subscribedUsersFile);
+  subscribedUsersFile.close();
+  return true;
 }
 
 void handleNewMessages(int numNewMessages) {
   for (int i = 0; i < numNewMessages; i++) {
+    String chat_id = bot.messages[i].chat_id;
     String text = bot.messages[i].text;
+    String from_name = bot.messages[i].from_name;
 
     if (text == "/start") {
-      registerChat(bot.messages[i].chat_id);
+      if (addSubscribedUser(chat_id, from_name)) {
+        String welcome = "Hoi, " + from_name + ", welkom bij De Kattenbak.\n";
+        welcome += "Je krijgt vanaf nu updates.\n";
+        welcome += "/status : als je wil weten hoe vaak het deurtje is geopend\n";
+        welcome += "/cleaned : als je de kattenbak hebt schoongemaakt\n";
+        welcome += "/stop : als je geen berichten meer wilt ontvangen\n";
+        bot.sendMessage(chat_id, welcome, "Markdown");
+      } else {
+        bot.sendMessage(chat_id, "Er is iets fout gegaan, probeer het later opnieuw?", "");
+      }
     }
 
-    if (text == "/cleaned" || text == "/reset") {
+    if (text == "/stop") {
+      if (removeSubscribedUser(chat_id)) {
+        bot.sendMessage(chat_id, "Thank you, " + from_name + ", we always waiting you back", "");
+      } else {
+        bot.sendMessage(chat_id, "Something wrong, please try again (later?)", "");
+      }
+    }
+
+    if (text == "/cleaned") {
       door_opened_times = 0;
-      notifyClean(bot.messages[i].chat_id);
+      notifyClean(chat_id);
     }
 
     if (text == "/status") {
       String statusMsg = "Het luik van de kattenbak is " + String(door_opened_times) + " keer geopend.";
-      bot.sendMessage(bot.messages[i].chat_id, statusMsg, "");
+      bot.sendMessage(chat_id, statusMsg, "");
     }
 
     if (text == "/noclean") {
@@ -71,22 +155,40 @@ void handleNewMessages(int numNewMessages) {
 }
 
 void handleNotification() {
-  for (int i = 0; i < registered_chat_ids_length; i++) {
-    Serial.print("Sending update to: ");
-    Serial.println(registered_chat_ids[i]);
-    bot.sendMessageWithReplyKeyboard(registered_chat_ids[i], "De kattenbak is vies!", "", keyboardJson, true);
-    notification_lasttime = millis();
+  JsonObject users = getSubscribedUsers();
+  unsigned int users_processed = 0;
+
+  Serial.println("Sending notification!");
+
+  for (JsonObject::iterator it = users.begin(); it != users.end(); ++it) {
+    users_processed++;
+    const char *chat_id = it->key().c_str();
+    bot.sendMessageWithReplyKeyboard(chat_id, "De kattenbak is vies!", "", keyboardJson, true);
   }
+
+  notification_lasttime = millis();
 }
 
-void notifyClean(String chat_id) {
+void notifyClean(String cleaned_by_chat_id) {
   Serial.println("Kattenbak is schoongemaakt");
 
-  for (int i = 0; i < registered_chat_ids_length; i++) {
-    if (chat_id != registered_chat_ids[i]) {
-      Serial.print("Sending update to: ");
-      Serial.println(registered_chat_ids[i]);
-      bot.sendMessage(registered_chat_ids[i], "De kattenbak is schoongemaakt :)", "");
+  JsonObject users = getSubscribedUsers();
+  unsigned int users_processed = 0;
+
+  for (JsonObject::iterator it = users.begin(); it != users.end(); ++it) {
+    users_processed++;
+    const char *chat_id = it->key().c_str();
+    String cleaned_by_name = "Guest";
+    if(users[cleaned_by_chat_id]) {
+      cleaned_by_name = String(users[cleaned_by_chat_id]);
+    }
+    Serial.print("Cleaned by: ");
+    Serial.println(cleaned_by_name);
+
+    if (cleaned_by_chat_id != chat_id) {
+      bot.sendMessage(chat_id, cleaned_by_name + " heeft de kattenbak schoongemaakt 🧹", "");
+    } else {
+      bot.sendMessage(chat_id, "Arlo & Remy danken u 🐈🐈‍⬛", "");
     }
   }
 }
@@ -94,6 +196,14 @@ void notifyClean(String chat_id) {
 void setup() {
   Serial.begin(115200);
   Serial.println();
+
+  if (!LittleFS.begin()) {
+    Serial.println("Failed to mount file system");
+    return;
+  }
+
+  // RESET STORAGE
+  // LittleFS.remove(SUBSCRIBED_USERS_FILENAME);
 
   // attempt to connect to Wifi network:
   Serial.print("Connecting to Wifi SSID ");
@@ -124,6 +234,9 @@ void setup() {
   }
 
   bot.setMyCommands(botCommandsJson);
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
 }
 
 void loop() {
