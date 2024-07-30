@@ -4,26 +4,27 @@
 #include <UniversalTelegramBot.h>
 #include <LittleFS.h>
 
-const unsigned long BOT_MTBS = 5000;  // mean time between scan messages
+const unsigned long BOT_MTBS = 2000;  // mean time between scan messages
 const unsigned long LIGHT_MTBR = 50;
-const int MAX_DOOR_OPENS = 15;
-const int MINUTES_NOTIFICATION_TIMEOUT = 5;
+const int MAX_DOOR_OPENS = 8;
 const int threshold = 25;
 
 X509List cert(TELEGRAM_CERTIFICATE_ROOT);
 WiFiClientSecure secured_client;
 UniversalTelegramBot bot(BOT_TOKEN, secured_client);
-unsigned long bot_lasttime;    // last time messages' scan has been done
-unsigned long light_lasttime;  // last time light sensor has been read
-unsigned long light_lasttimeouttime;
-unsigned long notification_lasttime;  // last time users have been notified
 
-int light_sensor = A0;
+const int TIMEOUT = 1000 * 60 * 1;  // 1 minute
+
+unsigned long bot_lasttime;                   // last time messages' scan has been done
+unsigned long movement_tripped_lasttime = -TIMEOUT;  // last time movement sensor has been tripped
+bool movement_tripped = false;
+bool notified = false;
+
+uint8_t MOVEMENT_SENSOR_PIN = 14;  // D5
 const int lightBufferSize = 25;    // Number of readings to store (adjust as needed)
 int lightBuffer[lightBufferSize];  // Buffer to store light sensor values
 int lightBufferIndex = 0;
 
-const int TIMEOUT = LIGHT_MTBR * (lightBufferSize + 1);
 
 int door_opened_times = 0;
 
@@ -37,7 +38,6 @@ const char *SUBSCRIBED_USERS_FILENAME = "/subscribed_users.json";  // Filename f
 JsonObject getSubscribedUsers() {
   File subscribedUsersFile = LittleFS.open(SUBSCRIBED_USERS_FILENAME, "r");
   JsonObject users;
-
 
   // no file
   if (!subscribedUsersFile) {
@@ -60,7 +60,6 @@ JsonObject getSubscribedUsers() {
 
   String file_content = subscribedUsersFile.readString();
   subscribedUsersFile.close();
-
 
   DeserializationError error = deserializeJson(usersDoc, file_content);
   if (error) {
@@ -121,7 +120,7 @@ void handleNewMessages(int numNewMessages) {
       if (addSubscribedUser(chat_id, from_name)) {
         String welcome = "Hoi, " + from_name + ", welkom bij De Kattenbak.\n";
         welcome += "Je krijgt vanaf nu updates.\n";
-        welcome += "/status : als je wil weten hoe vaak het deurtje is geopend\n";
+        welcome += "/status : als je wil weten hoe vaak de kattenbak is gebruikt\n";
         welcome += "/cleaned : als je de kattenbak hebt schoongemaakt\n";
         welcome += "/stop : als je geen berichten meer wilt ontvangen\n";
         bot.sendMessage(chat_id, welcome, "Markdown");
@@ -140,11 +139,12 @@ void handleNewMessages(int numNewMessages) {
 
     if (text == "/cleaned") {
       door_opened_times = 0;
+      notified = false;
       notifyClean(chat_id);
     }
 
     if (text == "/status") {
-      String statusMsg = "Het luik van de kattenbak is " + String(door_opened_times) + " keer geopend.";
+      String statusMsg = "De kattenbak is " + String(door_opened_times) + " keer gebruikt.";
       bot.sendMessage(chat_id, statusMsg, "");
     }
 
@@ -165,8 +165,6 @@ void handleNotification() {
     const char *chat_id = it->key().c_str();
     bot.sendMessageWithReplyKeyboard(chat_id, "De kattenbak is vies!", "", keyboardJson, true);
   }
-
-  notification_lasttime = millis();
 }
 
 void notifyClean(String cleaned_by_chat_id) {
@@ -179,16 +177,16 @@ void notifyClean(String cleaned_by_chat_id) {
     users_processed++;
     const char *chat_id = it->key().c_str();
     String cleaned_by_name = "Guest";
-    if(users[cleaned_by_chat_id]) {
+    if (users[cleaned_by_chat_id]) {
       cleaned_by_name = String(users[cleaned_by_chat_id]);
     }
     Serial.print("Cleaned by: ");
     Serial.println(cleaned_by_name);
 
     if (cleaned_by_chat_id != chat_id) {
-      bot.sendMessage(chat_id, cleaned_by_name + " heeft de kattenbak schoongemaakt 🧹", "");
+      bot.sendMessageWithReplyKeyboard(chat_id, cleaned_by_name + " heeft de kattenbak schoongemaakt 🧹", "", "");
     } else {
-      bot.sendMessage(chat_id, "Arlo & Remy danken u 🐈🐈‍⬛", "");
+      bot.sendMessageWithReplyKeyboard(chat_id, "Arlo & Remy danken u 🐈🐈‍⬛", "", "");
     }
   }
 }
@@ -228,10 +226,7 @@ void setup() {
   }
   Serial.println(now);
 
-  // Initialize the light buffer
-  for (int i = 0; i < lightBufferSize; i++) {
-    lightBuffer[i] = analogRead(light_sensor);
-  }
+  attachInterrupt(MOVEMENT_SENSOR_PIN, IntCallback, RISING);
 
   bot.setMyCommands(botCommandsJson);
 
@@ -239,44 +234,31 @@ void setup() {
   digitalWrite(LED_BUILTIN, LOW);
 }
 
+ICACHE_RAM_ATTR void IntCallback() {
+  const unsigned long time = millis();
+  Serial.print("Stamp(ms): ");
+  Serial.println(time);
+  movement_tripped = true;
+}
+
 void loop() {
   unsigned long time = millis();
 
-  if (time - light_lasttime > LIGHT_MTBR) {
-    // read light sensor
-    int light = analogRead(light_sensor);  // read the raw value from light_sensor pin (A0)
-
-    lightBuffer[lightBufferIndex] = light;                        // Store the light sensor value in the buffer
-    lightBufferIndex = (lightBufferIndex + 1) % lightBufferSize;  // Move to the next buffer index
-
-    if (time - light_lasttimeouttime > TIMEOUT) {
-      // Find the lowest value in the buffer
-      int maxValue = lightBuffer[0];
-      for (int i = 1; i < lightBufferSize; i++) {
-        if (lightBuffer[i] != 0 && lightBuffer[i] > maxValue) {
-          maxValue = lightBuffer[i];
-        }
-      }
-
-      if (maxValue - threshold > light) {
-        Serial.println("Open door detected!! Values: ");
-        Serial.print("val: ");
-        Serial.println(light);
-        Serial.print("max val: ");
-        Serial.println(maxValue);
-
-        door_opened_times++;
-
-        if (door_opened_times >= MAX_DOOR_OPENS) {
-          handleNotification();
-        }
-      }
-
-      light_lasttimeouttime = time;
-    }
-
-    light_lasttime = time;
+  if (movement_tripped == true) {
+    Serial.println(time - movement_tripped_lasttime);
   }
+
+  if (movement_tripped == true && (time - movement_tripped_lasttime > TIMEOUT)) {
+    movement_tripped_lasttime = time;
+    door_opened_times++;
+    Serial.println("Open door detected!!");
+
+    if (door_opened_times >= MAX_DOOR_OPENS && notified == false) {
+      handleNotification();
+      notified = true;
+    }
+  }
+  movement_tripped = false;
 
 
   // repeat messages
